@@ -60,8 +60,9 @@
 
 1. Клонируйте репозиторий:
 ```bash
-git clone https://github.com/Falcion/Debug.git
-cd Debug
+git clone https://github.com/angelomira/RefactoringMonolith3.git
+cd RefactoringMonolith3
+git branch refactoring
 ```
 
 2. Запустите все сервисы:
