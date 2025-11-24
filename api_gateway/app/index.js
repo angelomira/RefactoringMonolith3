@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const CircuitBreaker = require('opossum');
+const morgan = require('morgan');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -9,10 +10,12 @@ const PORT = process.env.PORT || 8000;
 // middleware
 app.use(cors());
 app.use(express.json());
+app.use(morgan('combined'));
 
 // адреса сервисов (в docker)
-const USERS_SERVICE_URL = 'http://service_users:8000';
-const ORDERS_SERVICE_URL = 'http://service_orders:8000';
+const USERS_SERVICE_URL = process.env.USERS_SERVICE_URL || 'http://service_users:3001';
+const ORDERS_SERVICE_URL = process.env.ORDERS_SERVICE_URL || 'http://service_orders:3002';
+const WAREHOUSE_SERVICE_URL = process.env.WAREHOUSE_SERVICE_URL || 'http://service_warehouse:3003';
 
 // конфигурация circuit breaker
 const circuitOptions = {
@@ -52,11 +55,27 @@ const ordersCircuit = new CircuitBreaker(async (url, options = {}) => {
     }
 }, circuitOptions);
 
+const warehouseCircuit = new CircuitBreaker(async (url, options = {}) => {
+    try {
+        const response = await axios({
+            url, ...options,
+            validateStatus: status => (status >= 200 && status < 300) || status === 404
+        });
+        return response.data;
+    } catch (error) {
+        if (error.response && error.response.status === 404) {
+            return error.response.data;
+        }
+        throw error;
+    }
+}, circuitOptions);
+
 // функции резервирования (fallback functions)
 usersCircuit.fallback(() => ({error: 'Users service temporarily unavailable'}));
 ordersCircuit.fallback(() => ({error: 'Orders service temporarily unavailable'}));
+warehouseCircuit.fallback(() => ({error: 'Warehouse service temporarily unavailable'}));
 
-// роутинги с circuit breaker
+// роутинги для Users с circuit breaker
 app.get('/users/:userId', async (req, res) => {
     try {
         const user = await usersCircuit.fire(`${USERS_SERVICE_URL}/users/${req.params.userId}`);
@@ -114,6 +133,7 @@ app.put('/users/:userId', async (req, res) => {
     }
 });
 
+// роутинги для Orders с circuit breaker
 app.get('/orders/:orderId', async (req, res) => {
     try {
         const order = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders/${req.params.orderId}`);
@@ -141,7 +161,11 @@ app.post('/orders', async (req, res) => {
 
 app.get('/orders', async (req, res) => {
     try {
-        const orders = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders`);
+        let url = `${ORDERS_SERVICE_URL}/orders`;
+        if (req.query.user_id) {
+            url += `?user_id=${req.query.user_id}`;
+        }
+        const orders = await ordersCircuit.fire(url);
         res.json(orders);
     } catch (error) {
         res.status(500).json({error: 'Internal server error'});
@@ -171,19 +195,59 @@ app.put('/orders/:orderId', async (req, res) => {
     }
 });
 
-app.get('/orders/status', async (req, res) => {
+// роутинги для Warehouse с circuit breaker
+app.post('/stock', async (req, res) => {
     try {
-        const status = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders/status`);
-        res.json(status);
+        const item = await warehouseCircuit.fire(`${WAREHOUSE_SERVICE_URL}/stock`, {
+            method: 'POST',
+            data: req.body
+        });
+        res.status(201).json(item);
     } catch (error) {
         res.status(500).json({error: 'Internal server error'});
     }
 });
 
-app.get('/orders/health', async (req, res) => {
+app.get('/stock/:id', async (req, res) => {
     try {
-        const health = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders/health`);
-        res.json(health);
+        const item = await warehouseCircuit.fire(`${WAREHOUSE_SERVICE_URL}/stock/${req.params.id}`);
+        if (item.error) {
+            res.status(404).json(item);
+        } else {
+            res.json(item);
+        }
+    } catch (error) {
+        res.status(500).json({error: 'Internal server error'});
+    }
+});
+
+app.get('/stock', async (req, res) => {
+    try {
+        const items = await warehouseCircuit.fire(`${WAREHOUSE_SERVICE_URL}/stock`);
+        res.json(items);
+    } catch (error) {
+        res.status(500).json({error: 'Internal server error'});
+    }
+});
+
+app.put('/stock/:id', async (req, res) => {
+    try {
+        const item = await warehouseCircuit.fire(`${WAREHOUSE_SERVICE_URL}/stock/${req.params.id}`, {
+            method: 'PUT',
+            data: req.body
+        });
+        res.json(item);
+    } catch (error) {
+        res.status(500).json({error: 'Internal server error'});
+    }
+});
+
+app.delete('/stock/:id', async (req, res) => {
+    try {
+        const result = await warehouseCircuit.fire(`${WAREHOUSE_SERVICE_URL}/stock/${req.params.id}`, {
+            method: 'DELETE'
+        });
+        res.json(result);
     } catch (error) {
         res.status(500).json({error: 'Internal server error'});
     }
@@ -197,9 +261,8 @@ app.get('/users/:userId/details', async (req, res) => {
         // получение сведений о пользователе
         const userPromise = usersCircuit.fire(`${USERS_SERVICE_URL}/users/${userId}`);
 
-        // получение заказов пользователя (предполагается, что заказы содержат поле userId)
-        const ordersPromise = ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders`)
-            .then(orders => orders.filter(order => order.userId == userId));
+        // получение заказов пользователя
+        const ordersPromise = ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders?user_id=${userId}`);
 
         // ожидание завершения обоих запросов
         const [user, userOrders] = await Promise.all([userPromise, ordersPromise]);
@@ -231,6 +294,10 @@ app.get('/health', (req, res) => {
             orders: {
                 status: ordersCircuit.status,
                 stats: ordersCircuit.stats
+            },
+            warehouse: {
+                status: warehouseCircuit.status,
+                stats: warehouseCircuit.stats
             }
         }
     });
@@ -252,4 +319,8 @@ app.listen(PORT, () => {
     ordersCircuit.on('open', () => console.log('Orders circuit breaker opened'));
     ordersCircuit.on('close', () => console.log('Orders circuit breaker closed'));
     ordersCircuit.on('halfOpen', () => console.log('Orders circuit breaker half-open'));
+
+    warehouseCircuit.on('open', () => console.log('Warehouse circuit breaker opened'));
+    warehouseCircuit.on('close', () => console.log('Warehouse circuit breaker closed'));
+    warehouseCircuit.on('halfOpen', () => console.log('Warehouse circuit breaker half-open'));
 });

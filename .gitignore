@@ -8,6 +8,8 @@ yarn-error.log
 dist/
 build/
 coverage/
+*.log
+logs/
 
 # IntelliJ IDEA
 .idea/
@@ -20,3 +22,6 @@ workspace.xml
 # OS-specific
 .DS_Store
 Thumbs.db
+
+# Docker
+docker-compose.override.yml
